@@ -128,20 +128,30 @@ def test_vision_chat_completion_token_count():
         ("What is this:\n",             "",                     False, None), # empty string
     ]
 )
-def test_vision_completion(prompt, image_data, success, re_content):
+@pytest.mark.parametrize("endpoint", ["/completions", "/v1/completions"])
+@pytest.mark.parametrize("stream", [False, True])
+def test_vision_completion(prompt, image_data, success, re_content, endpoint, stream):
     global server
     server.start()
-    res = server.make_request("POST", "/completions", data={
+    payload = {
+        "stream": stream,
         "temperature": 0.0,
         "top_k": 1,
         "prompt": {
             JSON_PROMPT_STRING_KEY: prompt,
             JSON_MULTIMODAL_KEY: [ get_img_url(image_data) ],
         },
-    })
+    }
+    if stream and success:
+        chunks = list(server.make_stream_request("POST", endpoint, data=payload))
+        assert chunks
+        content = "".join(chunk["content"] if endpoint == "/completions" else chunk["choices"][0]["text"] for chunk in chunks)
+        assert match_regex(re_content, content)
+        return
+    res = server.make_request("POST", endpoint, data=payload)
     if success:
         assert res.status_code == 200
-        content = res.body["content"]
+        content = res.body["content"] if endpoint == "/completions" else res.body["choices"][0]["text"]
         assert match_regex(re_content, content)
     else:
         assert res.status_code != 200
