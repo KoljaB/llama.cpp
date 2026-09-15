@@ -181,7 +181,7 @@ public:
 
     // same as recv(), but have timeout in seconds
     // if timeout is reached, nullptr is returned
-    server_task_result_ptr recv_with_timeout(const std::unordered_set<int> & id_tasks, int timeout);
+    server_task_result_ptr recv_with_timeout(const std::unordered_set<int> & id_tasks, int timeout, const std::function<bool()> & should_stop = {});
 
     // single-task version of recv()
     server_task_result_ptr recv(int id_task);
@@ -212,7 +212,7 @@ struct server_response_reader {
     // only used by streaming completions
     std::vector<task_result_state> states;
 
-    // should_stop function will be called each polling_interval_seconds
+    // should_stop is checked between waits of at most 10 ms
     server_response_reader(server_queue & queue_tasks, server_response & queue_results, int polling_interval_seconds)
         : queue_tasks(queue_tasks), queue_results(queue_results), polling_interval_seconds(polling_interval_seconds) {}
     ~server_response_reader() {

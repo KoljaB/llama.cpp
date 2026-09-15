@@ -447,11 +447,14 @@ server_task_result_ptr server_response::recv(const std::unordered_set<int> & id_
     // should never reach here
 }
 
-server_task_result_ptr server_response::recv_with_timeout(const std::unordered_set<int> & id_tasks, int timeout) {
+server_task_result_ptr server_response::recv_with_timeout(const std::unordered_set<int> & id_tasks, int timeout, const std::function<bool()> & should_stop) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(timeout);
+    std::unique_lock<std::mutex> lock(mutex_results);
     while (true) {
-        std::unique_lock<std::mutex> lock(mutex_results);
-
-        for (int i = 0; i < (int) queue_results.size(); i++) {
+        if (should_stop && should_stop()) {
+            return nullptr;
+        }
+        for (size_t i = 0; i < queue_results.size(); i++) {
             if (id_tasks.find(queue_results[i]->id) != id_tasks.end()) {
                 server_task_result_ptr res = std::move(queue_results[i]);
                 queue_results.erase(queue_results.begin() + i);
@@ -459,17 +462,18 @@ server_task_result_ptr server_response::recv_with_timeout(const std::unordered_s
             }
         }
 
-        std::cv_status cr_res = condition_results.wait_for(lock, std::chrono::seconds(timeout));
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= deadline) {
+            return nullptr;
+        }
+        // Unrelated results must not extend this reader's deadline.
+        const auto wake = should_stop ? std::min(deadline, now + std::chrono::milliseconds(10)) : deadline;
+        condition_results.wait_until(lock, wake);
         if (!running) {
             RES_DBG("%s : queue result stop\n", __func__);
             std::terminate(); // we cannot return here since the caller is HTTP code
         }
-        if (cr_res == std::cv_status::timeout) {
-            return nullptr;
-        }
     }
-
-    // should never reach here
 }
 
 server_task_result_ptr server_response::recv(int id_task) {
@@ -549,7 +553,10 @@ bool server_response_reader::has_next() const {
 // note: if one error is received, it will stop further processing and return error result
 server_task_result_ptr server_response_reader::next(const std::function<bool()> & should_stop) {
     while (true) {
-        server_task_result_ptr result = queue_results.recv_with_timeout(id_tasks, polling_interval_seconds);
+        server_task_result_ptr result = queue_results.recv_with_timeout(id_tasks, polling_interval_seconds, should_stop);
+        if (should_stop()) {
+            return nullptr;
+        }
         if (result == nullptr) {
             // timeout, check stop condition
             if (should_stop()) {
