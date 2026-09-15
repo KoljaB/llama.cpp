@@ -3833,6 +3833,18 @@ private:
 
                 GGML_ASSERT(slot.task->need_sampling());
 
+                if (slot.n_predict_max == 0) {
+                    llama_synchronize(slot.ctx_tgt);
+                    slot.stats.update_prompt_last();
+                    slot.stop = STOP_TYPE_LIMIT;
+                    slot.has_next_token = false;
+                    slot.i_batch = -1;
+                    slot.print_timings();
+                    send_final_response(slot);
+                    slot.release();
+                    return;
+                }
+
                 // prompt evaluated for next-token prediction
                 slot.state = SLOT_STATE_GENERATING;
 
