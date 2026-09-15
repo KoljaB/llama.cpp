@@ -666,3 +666,40 @@ def test_completion_prompt_cache():
         assert "prompt_n" in timings and timings["prompt_n"] + timings["cache_n"] == n_prompt
         assert "predicted_n" in timings and timings["predicted_n"] == n_predict
         assert "tokens" in res.body and isinstance(res.body["tokens"], list)
+
+@pytest.mark.parametrize("endpoint,limit_key", [
+    ("/completion", "n_predict"),
+    ("/v1/completions", "max_tokens"),
+])
+@pytest.mark.parametrize("stream", [False, True])
+def test_completion_cache_only(endpoint, limit_key, stream):
+    server.n_slots = 1
+    server.start()
+    prompt = "The old oak tree stood beside the quiet river. " * 5
+    payload = {"prompt": prompt, limit_key: 0, "cache_prompt": True, "id_slot": 0, "stream": stream}
+    if stream:
+        chunks = list(server.make_stream_request("POST", endpoint, data=payload))
+        assert chunks
+    else:
+        response = server.make_request("POST", endpoint, data=payload)
+        assert response.status_code == 200
+        chunks = [response.body]
+    for chunk in chunks:
+        if endpoint == "/completion":
+            assert chunk["content"] == ""
+        else:
+            assert all(choice["text"] == "" for choice in chunk["choices"])
+    final = chunks[-1]
+    assert final["timings"]["predicted_n"] == 0
+    assert final["timings"]["prompt_n"] > 1
+    if endpoint == "/completion":
+        assert final["stop_type"] == "limit"
+    else:
+        assert final["choices"][0]["finish_reason"] == "length"
+
+    response = server.make_request("POST", "/completion", data={
+        "prompt": prompt, "n_predict": 1, "cache_prompt": True, "id_slot": 0,
+    })
+    assert response.status_code == 200
+    assert response.body["timings"]["predicted_n"] == 1
+    assert response.body["timings"]["prompt_n"] <= 1
