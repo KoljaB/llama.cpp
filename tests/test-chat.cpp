@@ -8,6 +8,7 @@
 #include "../src/llama-grammar.h"
 #include "../src/unicode.h"
 #include "../tools/server/server-chat.h"
+#include "../tools/server/server-queue.h"
 #include "chat-auto-parser.h"
 #include "chat.h"
 #include "common.h"
@@ -7320,7 +7321,35 @@ static void test_msg_diffs_compute() {
     }
 }
 
+
+static void test_server_response_cancellation() {
+    server_queue tasks;
+    server_response results;
+    server_response_reader reader(tasks, results, 1);
+    reader.id_tasks.insert(1);
+    results.add_waiting_task_id(1);
+    auto result = std::make_unique<server_task_result_router>();
+    result->id = 1;
+    results.send(std::move(result));
+    GGML_ASSERT(reader.next([] { return true; }) == nullptr);
+    reader.stop();
+
+    server_response_reader waiting(tasks, results, 1);
+    waiting.id_tasks.insert(2);
+    results.add_waiting_task_id(2);
+    const auto start = std::chrono::steady_clock::now();
+    auto cancelled = waiting.next([&] {
+        return std::chrono::steady_clock::now() - start >= std::chrono::milliseconds(20);
+    });
+    GGML_ASSERT(cancelled == nullptr);
+    GGML_ASSERT(std::chrono::steady_clock::now() - start < std::chrono::milliseconds(500));
+}
+
 int main(int argc, char ** argv) {
+    if (argc == 2 && std::string(argv[1]) == "--server-queue") {
+        test_server_response_cancellation();
+        return 0;
+    }
     bool detailed_debug    = false;
     bool only_run_filtered = false;
 
@@ -7392,6 +7421,7 @@ int main(int argc, char ** argv) {
     } else
 #endif
     {
+        test_server_response_cancellation();
         test_msg_diffs_compute();
         test_msgs_oaicompat_json_conversion();
         test_msg_token_delimiters_split();

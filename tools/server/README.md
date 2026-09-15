@@ -1284,6 +1284,8 @@ See [OpenAI Completions API documentation](https://platform.openai.com/docs/api-
 
 llama.cpp `/completion`-specific features such as `mirostat` are supported.
 
+As a llama.cpp extension, `prompt` also accepts the multimodal object format supported by `/completion`, with `prompt_string` and `multimodal_data` fields. This requires a compatible model and a loaded multimodal projector.
+
 *Examples:*
 
 Example usage with `openai` python library:

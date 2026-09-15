@@ -3833,6 +3833,18 @@ private:
 
                 GGML_ASSERT(slot.task->need_sampling());
 
+                if (slot.n_predict_max == 0) {
+                    llama_synchronize(slot.ctx_tgt);
+                    slot.stats.update_prompt_last();
+                    slot.stop = STOP_TYPE_LIMIT;
+                    slot.has_next_token = false;
+                    slot.i_batch = -1;
+                    slot.print_timings();
+                    send_final_response(slot);
+                    slot.release();
+                    return;
+                }
+
                 // prompt evaluated for next-token prediction
                 slot.state = SLOT_STATE_GENERATING;
 
@@ -4291,7 +4303,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
         // process prompt
         std::vector<server_tokens> inputs;
 
-        if (res_type != TASK_RESPONSE_TYPE_NONE && ctx_server.mctx != nullptr) {
+        if (res_type != TASK_RESPONSE_TYPE_NONE && res_type != TASK_RESPONSE_TYPE_OAI_CMPL && ctx_server.mctx != nullptr) {
             // This is the case used by OAI compatible chat path with MTMD. TODO It can be moved to the path below.
             inputs.push_back(process_mtmd_prompt(ctx_server.mctx, prompt.get<std::string>(), files, ctx_server.init_opt));
         } else {
