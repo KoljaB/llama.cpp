@@ -958,6 +958,13 @@ private:
 
     bool sleeping = false;
 
+    int pause_task = -1;
+    int pause_control_task = -1;
+    int pause_resume_task = -1;
+    bool pause_resume_first_token_logged = false;
+    int64_t pause_resume_received_us = 0;
+    int64_t pause_resume_released_us = 0;
+
     int64_t t_last_load_progress_ms = 0;
 
     void destroy() {
@@ -1333,6 +1340,23 @@ private:
             };
 
             slot.callback_on_reset = [this](const server_slot & slot) {
+                // A release must not leave a global pause or resume retry marker behind.
+                const int id_task = slot.task->id;
+                const bool released_pause_owner = pause_task == id_task;
+                if (released_pause_owner) {
+                    pause_task = -1;
+                    pause_control_task = -1;
+                }
+                if (pause_resume_task == id_task) {
+                    pause_resume_task = -1;
+                    pause_resume_first_token_logged = false;
+                    pause_resume_received_us = 0;
+                    pause_resume_released_us = 0;
+                }
+                if (released_pause_owner) {
+                    queue_tasks.pop_deferred_tasks();
+                }
+
                 // flush the generated token stats before reset()
                 if (slot.stats.n_gen > 0) {
                     metrics_on_prediction(slot);
@@ -1869,6 +1893,12 @@ private:
     }
 
     bool process_token(completion_token_output & result, server_slot & slot) {
+        if (pause_resume_task == slot.task->id && !pause_resume_first_token_logged) {
+            const int64_t token_us = ggml_time_us();
+            SRV_INF("pause first_token task=%d received_us=%" PRId64 " released_us=%" PRId64 " token_us=%" PRId64 "\n",
+                    pause_resume_task, pause_resume_received_us, pause_resume_released_us, token_us);
+            pause_resume_first_token_logged = true;
+        }
         // remember which tokens were sampled - used for repetition penalties during sampling
         const std::string token_str = result.text_to_send;
         slot.sampled = result.tok;
@@ -2448,6 +2478,16 @@ private:
             return false;
         }
 
+        if (pause_task >= 0 &&
+                task.type != SERVER_TASK_TYPE_CONTROL && task.type != SERVER_TASK_TYPE_CANCEL &&
+                task.type != SERVER_TASK_TYPE_METRICS && task.type != SERVER_TASK_TYPE_SLOT_GET &&
+                task.type != SERVER_TASK_TYPE_NEXT_RESPONSE) {
+            // Keep new inference pending until the global pause gate is released.
+            // Deferring here avoids a busy retry loop while preserving CANCEL cleanup.
+            queue_tasks.defer(std::move(task));
+            return true;
+        }
+
         switch (task.type) {
             case SERVER_TASK_TYPE_COMPLETION:
             case SERVER_TASK_TYPE_INFILL:
@@ -2527,10 +2567,32 @@ private:
                         abort_cancelled.erase(task.id_target);
                     }
 
+                    bool released_pause_owner = false;
+
+                    // A disconnected control request must not strand a pause.
+                    if (pause_control_task == task.id_target) {
+                        pause_task = -1;
+                        pause_control_task = -1;
+                        queue_tasks.pop_deferred_tasks();
+                    }
                     // release slot linked with the task id
                     for (auto & slot : slots) {
                         if (slot.task && slot.task->id == task.id_target) {
+                            if (pause_task == task.id_target) {
+                                pause_task = -1;
+                                pause_control_task = -1;
+                                released_pause_owner = true;
+                            }
+                            if (pause_resume_task == task.id_target) {
+                                pause_resume_task = -1;
+                                pause_resume_first_token_logged = false;
+                                pause_resume_received_us = 0;
+                                pause_resume_released_us = 0;
+                            }
                             slot.release();
+                            if (released_pause_owner) {
+                                queue_tasks.pop_deferred_tasks();
+                            }
                             break;
                         }
                     }
@@ -2550,7 +2612,57 @@ private:
                         break;
                     }
 
-                    if (task.params.control_action == "reasoning_end") {
+                    if (task.params.control_action == "pause" || task.params.control_action == "resume") {
+                        const int id_task = slot->task->id;
+                        const bool pausing = task.params.control_action == "pause";
+                        const bool already_paused = pause_task == id_task;
+                        const bool already_resumed = pause_resume_task == id_task && pause_task < 0;
+                        if (slot->state != SLOT_STATE_GENERATING ||
+                                (pause_task >= 0 && !already_paused) ||
+                                (!pausing && !already_paused && !already_resumed)) {
+                            res->message = "pause requires a generating completion; resume requires its active pause";
+                            queue_results.send(std::move(res));
+                            break;
+                        }
+                        res->pause = true;
+                        res->id_task = id_task;
+                        res->received_us = task.params.control_received_us;
+                        res->boundary_us = ggml_time_us();
+                        if (pausing) {
+                            if (!already_paused) {
+                                // No new batch can start on this thread until the owner resumes.
+                                pause_task = id_task;
+                                pause_control_task = task.id;
+                                pause_resume_task = -1;
+                                pause_resume_first_token_logged = false;
+                                llama_synchronize(ctx_tgt);
+                                if (ctx_dft) {
+                                    llama_synchronize(ctx_dft);
+                                }
+                                res->sync_us = ggml_time_us() - res->boundary_us;
+                            }
+                            // A repeated pause is an acknowledgement-only no-op. Keep the
+                            // original control task as the cancellation owner.
+                        } else if (already_paused) {
+                            pause_task = -1;
+                            pause_control_task = -1;
+                            pause_resume_task = id_task;
+                            pause_resume_first_token_logged = false;
+                            pause_resume_received_us = res->received_us;
+                            pause_resume_released_us = ggml_time_us();
+                            queue_tasks.pop_deferred_tasks();
+                        }
+                        res->completed_us = ggml_time_us();
+                        res->generated = slot->stats.n_gen;
+                        res->prompt_tokens = slot->prompt.n_tokens();
+                        res->target_pos = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot->id);
+                        if (ctx_dft) {
+                            res->draft_pos = llama_memory_seq_pos_max(llama_get_memory(ctx_dft), slot->id);
+                        }
+                        res->success = true;
+                        SRV_INF("pause %s task=%d received_us=%" PRId64 " boundary_us=%" PRId64 " completed_us=%" PRId64 " generated=%" PRId64 "\n",
+                                task.params.control_action.c_str(), id_task, res->received_us, res->boundary_us, res->completed_us, res->generated);
+                    } else if (task.params.control_action == "reasoning_end") {
                         // the budget sampler only exists when reasoning control was armed
                         if (!slot->task->params.sampling.reasoning_control) {
                             res->success = false;
@@ -2865,6 +2977,9 @@ private:
 #endif
 
     void update_slots() {
+        if (pause_task >= 0) {
+            return;
+        }
 #ifdef DEBUG_TIMINGS
         static int64_t t_prev = 0;
         int64_t t_start = ggml_time_us();
@@ -4744,6 +4859,22 @@ server_routes::server_routes(const common_params & params, server_context & ctx_
     });
 }
 
+static bool pause_enabled() {
+    const char * env = std::getenv("LLAMA_SERVER_PAUSE");
+    return env && std::string(env) == "1";
+}
+
+static json get_res_pause_capability() {
+    return {
+        {"enabled", pause_enabled()},
+        {"endpoint", "/v1/chat/completions/control"},
+        {"actions", json::array({"pause", "resume"})},
+        {"binding", "completion_id"},
+        {"scope", "all_active_slots"},
+        {"preserves_generation_state", true},
+    };
+}
+
 static json get_res_model_info(const server_context_meta & meta) {
     // note: do NOT use ctx_server here, otherwise it's not possible to use this during sleep
 
@@ -4754,6 +4885,12 @@ static json get_res_model_info(const server_context_meta & meta) {
         {"object",   "model"},
         {"created",  std::time(0)},
         {"owned_by", "llamacpp"},
+        {"capabilities", {
+            {"completion", true},
+            {"multimodal", meta.has_mtmd},
+            {"completion_pause", pause_enabled()},
+        }},
+        {"pause_resume", get_res_pause_capability()},
         {"meta",     {
             {"vocab_type",  meta.model_vocab_type},
             {"n_vocab",     meta.model_vocab_n_tokens},
@@ -4781,7 +4918,13 @@ static json get_res_models(const server_context_meta & meta) {
                 {"type", "model"},
                 {"description", ""},
                 {"tags", json::array({""})},
-                {"capabilities", meta.has_mtmd ? json::array({"completion","multimodal"}) : json::array({"completion"})},
+                {"capabilities", {
+                    {"completion", true},
+                    {"multimodal", meta.has_mtmd},
+                    {"completion_pause", pause_enabled()},
+                }},
+                {"capability_names", meta.has_mtmd ? json::array({"completion","multimodal"}) : json::array({"completion"})},
+                {"pause_resume", get_res_pause_capability()},
                 {"parameters", ""},
                 {"details", {
                     {"parent_model", ""},
@@ -4816,6 +4959,8 @@ static json get_res_props(const server_context_meta & meta, const common_params 
     json props = {
         { "default_generation_settings", default_generation_settings_for_props },
         { "total_slots",                 params.n_parallel },
+        { "capabilities",                 json {{"completion_pause", pause_enabled()}} },
+        { "pause_resume",                get_res_pause_capability() },
         { "model_alias",                 meta.model_name },
         { "model_ftype",                 meta.model_ftype },
         { "model_path",                  meta.model_path },
@@ -5152,6 +5297,7 @@ void server_routes::init_routes() {
     };
 
     this->post_control = [this](const server_http_req & req) {
+        const int64_t received_us = ggml_time_us();
         auto res = create_response();
         const json body = json::parse(req.body);
 
@@ -5161,7 +5307,9 @@ void server_routes::init_routes() {
             res->error(format_error_response("missing completion id", ERROR_TYPE_INVALID_REQUEST));
             return res;
         }
-        if (action != "reasoning_end") {
+        const char * pause_env = std::getenv("LLAMA_SERVER_PAUSE");
+        const bool pause_is_enabled = pause_env && std::string(pause_env) == "1";
+        if (action != "reasoning_end" && !(pause_is_enabled && (action == "pause" || action == "resume"))) {
             res->error(format_error_response("unknown control action", ERROR_TYPE_INVALID_REQUEST));
             return res;
         }
@@ -5172,7 +5320,8 @@ void server_routes::init_routes() {
             task.id              = rd.get_new_id();
             task.params.control_cmpl_id = cmpl_id;
             task.params.control_action  = action;
-            rd.post_task(std::move(task));
+            task.params.control_received_us = received_us;
+            rd.post_task(std::move(task), action == "pause" || action == "resume");
         }
 
         auto result = rd.next(req.should_stop);

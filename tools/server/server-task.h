@@ -87,6 +87,7 @@ struct task_params {
 
     // realtime control (SERVER_TASK_TYPE_CONTROL)
     std::string        control_action;
+    int64_t            control_received_us = 0;
     std::string        control_cmpl_id;
 
     // per-request parameters for chat parsing
@@ -539,9 +540,26 @@ struct server_task_result_slot_erase : server_task_result {
 struct server_task_result_control : server_task_result {
     bool        success = false;
     std::string message; // optional detail when success is false
+    bool pause = false;
+    int id_task = -1;
+    int64_t received_us = 0;
+    int64_t boundary_us = 0;
+    int64_t completed_us = 0;
+    int64_t sync_us = 0;
+    int64_t generated = 0;
+    int64_t prompt_tokens = 0;
+    int64_t target_pos = -1;
+    int64_t draft_pos = -1;
 
     virtual json to_json() override {
         json out = json { { "success", success } };
+        if (pause) {
+            out["pause"] = {
+                {"id_task", id_task}, {"received_us", received_us}, {"boundary_us", boundary_us},
+                {"completed_us", completed_us}, {"sync_us", sync_us}, {"generated", generated},
+                {"prompt_tokens", prompt_tokens}, {"target_pos", target_pos}, {"draft_pos", draft_pos},
+            };
+        }
         if (!message.empty()) {
             out["message"] = message;
         }

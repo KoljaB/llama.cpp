@@ -112,6 +112,19 @@ void server_queue::pop_deferred_task(int id_slot) {
     condition_tasks.notify_one();
 }
 
+void server_queue::pop_deferred_tasks() {
+    std::unique_lock<std::mutex> lock(mutex_tasks);
+    while (!queue_tasks_deferred.empty()) {
+        // Move from the back so the original FIFO order is preserved at the front.
+        queue_tasks.emplace_front(std::move(queue_tasks_deferred.back()));
+        queue_tasks_deferred.pop_back();
+    }
+    if (!queue_tasks.empty()) {
+        time_last_task = ggml_time_ms();
+        condition_tasks.notify_one();
+    }
+}
+
 void server_queue::wait_until_no_sleep() {
     std::unique_lock<std::mutex> lock(mutex_tasks);
     if (!sleeping) {
