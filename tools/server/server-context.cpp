@@ -261,6 +261,9 @@ struct server_slot {
 
     // prompt tokens processed before the prompt part of the current batch
     int32_t n_tokens_batch_start = -1;
+
+    // n_tokens of the checkpoint restored for the current task, until its first prompt batch
+    int64_t n_tokens_restored = -1;
     std::mt19937 spec_synth_rng;
 
     // TODO: move members that belong to the task (such as `generated_text`, `has_new_line`) to task_results_state
@@ -3214,6 +3217,7 @@ private:
                         slot.stats.update_prompt_start();
 
                         slot.state = SLOT_STATE_PROCESSING_PROMPT;
+                        slot.n_tokens_restored = -1;
 
                         SLT_TRC(slot, "new prompt, n_ctx_slot = %d, n_keep = %d, task.n_tokens = %d\n",
                                 slot.n_ctx, slot.task->params.n_keep, slot.task->n_tokens());
@@ -3449,6 +3453,8 @@ private:
                                                     (ggml_time_us() - t_restore) / 1000.0, it->n_tokens,
                                                     (float) it->data_tgt.size() / 1024 / 1024, (float) it->data_dft.size() / 1024 / 1024);
                                         }
+
+                                        slot.n_tokens_restored = it->n_tokens;
 
                                         pos_next = std::min(pos_next, std::max(it->pos_min + 1, it->pos_max));
                                         n_past   = std::min(slot.prompt.tokens.size_up_to_pos(pos_next), (size_t) it->n_tokens);
@@ -3711,7 +3717,14 @@ private:
 
                     // note: we create the checkpoint before calling llama_decode(), so the current batch is not
                     //       yet processed and therefore it is not part of the checkpoint.
-                    if (do_checkpoint) {
+                    // the checkpoint restored for this task already holds the state at the start of its first batch
+                    const bool is_restored = n_tokens_start == slot.n_tokens_restored &&
+                        std::any_of(slot.prompt.checkpoints.begin(), slot.prompt.checkpoints.end(), [&](const auto & cur) {
+                            return cur.n_tokens == n_tokens_start;
+                        });
+                    slot.n_tokens_restored = -1;
+
+                    if (do_checkpoint && !is_restored) {
                         create_checkpoint(slot, n_tokens_cur, pos_min, pos_max);
                     }
                 }
