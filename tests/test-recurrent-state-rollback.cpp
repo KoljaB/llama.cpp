@@ -429,8 +429,60 @@ static int test_rollback(const common_params & params, llama_model * model, uint
     return 0;
 }
 
+static bool test_checkpoint_retention() {
+    std::list<common_prompt_checkpoint> checkpoints;
+    for (int i = 0; i < 128; ++i) {
+        while (checkpoints.size() >= 40) {
+            const size_t index = common_prompt_checkpoint_eviction_index(checkpoints, 31);
+            if (index >= checkpoints.size() - 31) {
+                fprintf(stderr, "retention removed a recent checkpoint\n");
+                return false;
+            }
+            checkpoints.erase(std::next(checkpoints.begin(), index));
+        }
+        common_prompt_checkpoint checkpoint;
+        checkpoint.update_pos(1024 + i * 384, 1023 + i * 384, 1023 + i * 384);
+        checkpoint.id_task = i;
+        checkpoint.data_tgt.assign(32, (uint8_t) i);
+        checkpoints.push_back(std::move(checkpoint));
+        if (checkpoints.size() > 40) {
+            fprintf(stderr, "retention exceeded the checkpoint budget\n");
+            return false;
+        }
+        const size_t recent = std::min<size_t>(32, i + 1);
+        for (size_t j = 0; j < recent; ++j) {
+            const auto & current = *std::next(checkpoints.begin(), checkpoints.size() - recent + j);
+            const int expected = i + 1 - recent + j;
+            if (current.id_task != expected || current.data_tgt != std::vector<uint8_t>(32, (uint8_t) expected)) {
+                fprintf(stderr, "retention changed the dense suffix or its state\n");
+                return false;
+            }
+        }
+    }
+    int64_t source_prefix = 0;
+    for (const auto & checkpoint : checkpoints) {
+        if (checkpoint.pos_max <= 24000) {
+            source_prefix = std::max(source_prefix, checkpoint.n_tokens);
+        }
+    }
+    if (source_prefix < 16000) {
+        fprintf(stderr, "source revocation has no retained useful old checkpoint: %lld\n", (long long) source_prefix);
+        return false;
+    }
+    fprintf(stderr, "checkpoint retention: 32 recent, at most 8 older, source prefix %lld, total %zu\n",
+            (long long) source_prefix, checkpoints.size());
+    return true;
+}
+
 int main(int argc, char ** argv) {
     std::setlocale(LC_NUMERIC, "C");
+
+    if (!test_checkpoint_retention()) {
+        return 1;
+    }
+    if (argc == 2 && std::string(argv[1]) == "--checkpoint-retention-only") {
+        return 0;
+    }
 
     common_params params;
     params.sampling.seed = 1234;

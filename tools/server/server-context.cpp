@@ -685,10 +685,19 @@ struct server_slot {
 
     json to_json(bool only_metrics = false) const {
         json res;
+        size_t checkpoint_bytes = 0;
+        size_t checkpoint_max_bytes = 0;
+        for (const auto & checkpoint : prompt.checkpoints) {
+            checkpoint_bytes += checkpoint.size();
+            checkpoint_max_bytes = std::max(checkpoint_max_bytes, checkpoint.size());
+        }
 
         res = {
             {"id",            id},
             {"n_ctx",         n_ctx},
+            {"n_ctx_checkpoints", prompt.checkpoints.size()},
+            {"ctx_checkpoint_bytes", checkpoint_bytes},
+            {"ctx_checkpoint_max_bytes", checkpoint_max_bytes},
             {"speculative",   can_speculate()},
             {"is_processing", is_processing()},
         };
@@ -2328,16 +2337,6 @@ private:
             ++it;
         }
 
-        while (slot.prompt.checkpoints.size() >= (size_t) params_base.n_ctx_checkpoints) {
-            // make room for the new checkpoint, if needed
-            const auto & cur = slot.prompt.checkpoints.front();
-
-            SLT_WRN(slot, "erasing old context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
-                    cur.pos_min, cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024);
-
-            slot.prompt.checkpoints.erase(slot.prompt.checkpoints.begin());
-        }
-
         // replace an existing checkpoint at the same n_tokens instead of appending a duplicate
         {
             const int64_t n_tokens_new = slot.prompt.n_tokens() - n_tokens_cur;
@@ -2349,6 +2348,21 @@ private:
                     ++it;
                 }
             }
+        }
+
+        const size_t n_max = params_base.n_ctx_checkpoints;
+        const size_t n_history = params_base.checkpoint_min_step == 0 && n_max > 32 ? std::min<size_t>(8, n_max - 32) : 0;
+        const size_t n_recent = n_max - n_history;
+        while (slot.prompt.checkpoints.size() >= n_max) {
+            // Leave room for the new checkpoint while keeping the recent suffix dense.
+            const size_t index = n_history ? common_prompt_checkpoint_eviction_index(slot.prompt.checkpoints, n_recent - 1) : 0;
+            const auto it = std::next(slot.prompt.checkpoints.begin(), index);
+            const auto & cur = *it;
+
+            SLT_WRN(slot, "erasing old context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
+                    cur.pos_min, cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024);
+
+            slot.prompt.checkpoints.erase(it);
         }
 
         auto & cur = slot.prompt.checkpoints.emplace_back();

@@ -2251,6 +2251,32 @@ bool common_prompt_batch_decode(
     return true;
 }
 
+size_t common_prompt_checkpoint_eviction_index(
+        const std::list<common_prompt_checkpoint> & checkpoints,
+        size_t n_recent) {
+    GGML_ASSERT(checkpoints.size() > n_recent);
+    const size_t n_older = checkpoints.size() - n_recent;
+    if (n_older < 3) {
+        return 0;
+    }
+
+    auto before = checkpoints.begin();
+    auto after = std::next(before, 2);
+    size_t index = 1;
+    int64_t smallest_span = after->n_tokens - before->n_tokens;
+    // Keep the oldest anchor and thin the closest pair of older gaps.
+    for (size_t i = 2; i + 1 < n_older; ++i) {
+        ++before;
+        ++after;
+        const int64_t span = after->n_tokens - before->n_tokens;
+        if (span < smallest_span) {
+            smallest_span = span;
+            index = i;
+        }
+    }
+    return index;
+}
+
 size_t common_prompt_checkpoint::size() const {
     return data_tgt.size() + data_dft.size() + data_spec.size();
 }

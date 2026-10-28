@@ -1211,3 +1211,8 @@ struct common_prompt_checkpoint {
     void clear_tgt();
     void clear_dft();
 };
+
+// Select an older checkpoint to remove without touching the recent suffix.
+size_t common_prompt_checkpoint_eviction_index(
+        const std::list<common_prompt_checkpoint> & checkpoints,
+        size_t n_recent);
