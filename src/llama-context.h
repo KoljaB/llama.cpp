@@ -247,6 +247,9 @@ public:
     // returns the result of ggml_backend_sched_graph_compute_async execution
     ggml_status graph_compute(ggml_cgraph * gf, bool batched);
 
+    // scheduler eval callback that stops the graph at a layer boundary when the abort callback fires
+    static bool graph_abort_eval_callback(ggml_tensor * t, bool ask, void * user_data);
+
     // reserve a graph with a dummy ubatch of the specified size
     ggml_cgraph * graph_reserve(
         uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, bool split_only = false, size_t * sizes = nullptr);

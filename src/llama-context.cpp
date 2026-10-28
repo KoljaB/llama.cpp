@@ -1393,7 +1393,20 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
 
+    // a prompt-sized ubatch checks the abort callback at every layer boundary, so a cancelled
+    // request does not hold the context for the whole ubatch; small ubatches keep a single
+    // graph launch (and CUDA graphs) for token generation
+    const bool abort_layers = abort_callback != nullptr && cparams.cb_eval == nullptr && ubatch.n_tokens >= 32;
+    ggml_backend_sched_set_eval_callback(sched.get(),
+            abort_layers ? graph_abort_eval_callback : cparams.cb_eval,
+            abort_layers ? this                      : cparams.cb_eval_user_data);
+
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+    if (status == GGML_STATUS_ABORTED) {
+        LLAMA_LOG_DEBUG("%s: graph compute aborted\n", __func__);
+        ret = status;
+        return nullptr;
+    }
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
@@ -2511,13 +2524,24 @@ ggml_status llama_context::graph_compute(
     }
 
     auto status = ggml_backend_sched_graph_compute_async(sched.get(), gf);
-    if (status != GGML_STATUS_SUCCESS) {
+    if (status != GGML_STATUS_SUCCESS && status != GGML_STATUS_ABORTED) {
         LLAMA_LOG_ERROR("%s: ggml_backend_sched_graph_compute_async failed with error %d\n", __func__, status);
     }
 
     // fprintf(stderr, "splits: %d\n", ggml_backend_sched_get_n_splits(sched));
 
     return status;
+}
+
+bool llama_context::graph_abort_eval_callback(ggml_tensor * t, bool ask, void * user_data) {
+    auto * ctx = (llama_context *) user_data;
+
+    if (ask) {
+        // synchronize after each layer output
+        return strncmp(t->name, "l_out-", 6) == 0;
+    }
+
+    return !ctx->abort_callback(ctx->abort_callback_data);
 }
 
 llm_graph_cb llama_context::graph_get_cb() const {

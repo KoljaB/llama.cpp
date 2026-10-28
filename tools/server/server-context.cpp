@@ -18,10 +18,12 @@
 #include "mtmd-helper.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cstddef>
 #include <cinttypes>
 #include <exception>
 #include <memory>
+#include <mutex>
 #include <filesystem>
 #include <random>
 #include <utility>
@@ -256,6 +258,9 @@ struct server_slot {
     std::vector<int32_t> spec_i_batch;
     common_prompt_checkpoint spec_ckpt;
     bool spec_is_replay = false;
+
+    // prompt tokens processed before the prompt part of the current batch
+    int32_t n_tokens_batch_start = -1;
     std::mt19937 spec_synth_rng;
 
     // TODO: move members that belong to the task (such as `generated_text`, `has_new_line`) to task_results_state
@@ -921,6 +926,13 @@ private:
 
     int n_empty_consecutive = 0;
 
+    // a cancel that arrives while a prompt batch is decoding is noted by the queue worker; the decode stops
+    // at the next layer boundary when every task in the batch is cancelled and the batch can be dropped
+    std::mutex        mutex_abort;
+    std::set<int>     abort_cancelled; // tasks cancelled during a decode, until the cancel task itself is processed
+    std::vector<int>  abort_tasks;     // tasks of the running decode, empty if it cannot be dropped
+    std::atomic<bool> abort_decode{false};
+
     std::unique_ptr<server_prompt_cache> prompt_cache;
 
     server_metrics metrics;
@@ -1263,6 +1275,10 @@ private:
         for (int i = 0; i < params_base.n_parallel; i++) {
             slots.emplace_back();
         }
+
+        llama_set_abort_callback(ctx_tgt, [](void * data) {
+            return static_cast<server_context_impl *>(data)->abort_decode.load(std::memory_order_relaxed);
+        }, this);
 
         // try speculative decoding
         if (ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_NO) {
@@ -2387,6 +2403,18 @@ private:
 
     // returns false to decline the task, it is offered again after the decode is done
     bool process_single_task(server_task && task, bool is_yielding) {
+        if (is_yielding && task.type == SERVER_TASK_TYPE_CANCEL) {
+            // let the running decode stop early; the cancel itself is handled after the decode
+            std::lock_guard<std::mutex> lock(mutex_abort);
+            abort_cancelled.insert(task.id_target);
+            if (!abort_tasks.empty() && std::all_of(abort_tasks.begin(), abort_tasks.end(), [&](int id) {
+                        return abort_cancelled.count(id) > 0;
+                    })) {
+                abort_decode = true;
+            }
+            return false;
+        }
+
         // while yielding, an encode / decode is running and only reading the server state is safe
         if (is_yielding && task.type != SERVER_TASK_TYPE_METRICS && task.type != SERVER_TASK_TYPE_SLOT_GET) {
             SRV_DBG("decoding, decline task, id_task = %d\n", task.id);
@@ -2467,6 +2495,11 @@ private:
                 } break;
             case SERVER_TASK_TYPE_CANCEL:
                 {
+                    {
+                        std::lock_guard<std::mutex> lock(mutex_abort);
+                        abort_cancelled.erase(task.id_target);
+                    }
+
                     // release slot linked with the task id
                     for (auto & slot : slots) {
                         if (slot.task && slot.task->id == task.id_target) {
@@ -3597,6 +3630,8 @@ private:
 
                     const auto n_tokens_start = slot.prompt.n_tokens() - n_tokens_cur;
 
+                    slot.n_tokens_batch_start = n_tokens_start;
+
                     const bool near_prompt_end = slot.task->n_tokens() < slot.prompt.n_tokens() + n_ubatch;
 
                     const bool is_user_start = spans.is_user_start(n_tokens_start);
@@ -3656,6 +3691,60 @@ private:
         }
     }
 
+    // slots of a batch that may be dropped if they are cancelled: the whole batch is prompt tokens of these
+    // slots, and each slot has a checkpoint at the start of its part, so the next task resumes from there
+    // returns an empty list if the batch must complete
+    std::vector<server_slot *> get_droppable_slots(int32_t off, int32_t n_tokens) {
+        std::vector<server_slot *> res;
+
+        if (off != 0 || n_tokens != batch.size() || batch.has_embd) {
+            return res;
+        }
+
+        for (int32_t i = 0; i < n_tokens; ++i) {
+            const auto & t = batch.tokens[i];
+            if (!t.is_prompt) {
+                return {};
+            }
+
+            auto * slot = &slots[t.id_slot];
+            if (std::find(res.begin(), res.end(), slot) != res.end()) {
+                continue;
+            }
+
+            if (!slot->task || slot->task->is_parent() || slot->task->is_child() ||
+                (slot->state != SLOT_STATE_PROCESSING_PROMPT && slot->state != SLOT_STATE_DONE_PROMPT)) {
+                return {};
+            }
+
+            const auto & checkpoints = slot->prompt.checkpoints;
+            const bool has_ckpt = std::any_of(checkpoints.begin(), checkpoints.end(), [&](const auto & cur) {
+                return cur.n_tokens == slot->n_tokens_batch_start;
+            });
+            if (!has_ckpt) {
+                return {};
+            }
+
+            res.push_back(slot);
+        }
+
+        return res;
+    }
+
+    // release cancelled slots whose batch was not (fully) decoded
+    // the memory past the batch start is inconsistent, so the prompt is cut back to the checkpoint at the
+    // batch start; the next task restores that checkpoint before it removes the rest of the memory
+    void drop_cancelled_batch(const std::vector<server_slot *> & drop_slots, bool aborted) {
+        for (auto * slot : drop_slots) {
+            SLT_INF(*slot, "dropped cancelled prompt batch (%s), n_tokens = %d -> %d\n",
+                    aborted ? "aborted" : "skipped", slot->prompt.n_tokens(), slot->n_tokens_batch_start);
+
+            slot->prompt.tokens.keep_first(slot->n_tokens_batch_start);
+            slot->i_batch = -1;
+            slot->release();
+        }
+    }
+
     // returns true = success ; false = retry with smaller batch size
     // throw std::runtime_error on fatal error
     bool decode(int32_t & n_batch, int32_t off, llama_batch & batch_view) {
@@ -3689,15 +3778,44 @@ private:
             has_output |= batch.tokens[i].output;
         }
 
+        // a prompt batch whose tasks are all cancelled can be dropped mid-decode
+        std::vector<server_slot *> abort_slots = get_droppable_slots(off, batch_view.n_tokens);
+        {
+            std::lock_guard<std::mutex> lock(mutex_abort);
+            abort_tasks.clear();
+            for (const auto * slot : abort_slots) {
+                abort_tasks.push_back(slot->task->id);
+            }
+            abort_decode = !abort_tasks.empty() && std::all_of(abort_tasks.begin(), abort_tasks.end(), [&](int id) {
+                return abort_cancelled.count(id) > 0;
+            });
+        }
+
         // yield to the queue, so we can still handle metrics tasks while decoding
         // note: the sync is done here too, so that the wait is also covered by the yield
         int ret = 0;
-        queue_tasks.yield_to_queue([&]() {
-            ret = llama_decode(ctx_tgt, batch_view);
-            if (ret == 0 && has_output) {
-                llama_synchronize(ctx_tgt);
-            }
-        });
+        if (!abort_decode) {
+            queue_tasks.yield_to_queue([&]() {
+                ret = llama_decode(ctx_tgt, batch_view);
+                if (ret == 0 && has_output) {
+                    llama_synchronize(ctx_tgt);
+                }
+            });
+        }
+
+        bool dropped = false;
+        {
+            std::lock_guard<std::mutex> lock(mutex_abort);
+            // also drop a batch whose cancel arrived after its last layer, to skip the draft pass
+            dropped = abort_decode && (ret == 0 || ret == 2);
+            abort_tasks.clear();
+            abort_decode = false;
+        }
+
+        if (dropped) {
+            drop_cancelled_batch(abort_slots, ret == 2);
+            return true;
+        }
 
         if (ret != 0) {
             {
