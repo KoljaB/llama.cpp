@@ -922,6 +922,7 @@ private:
 
     int trace = 0;        // env: LLAMA_TRACE
     int slots_debug = 0;  // env: LLAMA_SERVER_SLOTS_DEBUG
+    int phase_timing = 0; // env: LLAMA_SERVER_PHASE_TIMING
     int slots_n_diff = 0; // env: LLAMA_SERVER_SLOTS_N_DIFF
 
     int n_empty_consecutive = 0;
@@ -1353,6 +1354,15 @@ private:
 
             if (slots_debug) {
                 SRV_WRN("LLAMA_SERVER_SLOTS_DEBUG = %d\n", slots_debug);
+            }
+        }
+
+        {
+            const char * LLAMA_SERVER_PHASE_TIMING = getenv("LLAMA_SERVER_PHASE_TIMING");
+            phase_timing = LLAMA_SERVER_PHASE_TIMING ? atoi(LLAMA_SERVER_PHASE_TIMING) : 0;
+
+            if (phase_timing) {
+                SRV_WRN("LLAMA_SERVER_PHASE_TIMING = %d (decodes are synchronized)\n", phase_timing);
             }
         }
 
@@ -2334,6 +2344,14 @@ private:
     void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max) {
         const int id_task = slot.task->id;
 
+        if (phase_timing) {
+            // attribute the wait for a pending decode separately from the checkpoint itself
+            const int64_t t_sync = ggml_time_us();
+            llama_synchronize(ctx_tgt);
+            SLT_INF(slot, "phase checkpoint-sync: %.3f ms\n", (ggml_time_us() - t_sync) / 1000.0);
+        }
+        const int64_t t_ckpt = ggml_time_us();
+
         // evict checkpoints within min-step of a previous checkpoint, unless they were
         // created by the current task
         // only when the list is full, otherwise short prompts keep just the oldest checkpoint
@@ -2394,6 +2412,12 @@ private:
         cur.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
         // stash the draft's speculative state with the checkpoint
         common_speculative_get_state(spec.get(), slot.id, cur.data_spec);
+
+        if (phase_timing) {
+            SLT_INF(slot, "phase checkpoint: %.3f ms (n_tokens = %" PRId64 ", tgt = %.3f MiB, dft = %.3f MiB)\n",
+                    (ggml_time_us() - t_ckpt) / 1000.0, cur.n_tokens,
+                    (float) cur.data_tgt.size() / 1024 / 1024, (float) cur.data_dft.size() / 1024 / 1024);
+        }
 
         SLT_TRC(slot,
                 "created context checkpoint %d of %d (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
@@ -3412,11 +3436,19 @@ private:
                                     bool do_reset = it == slot.prompt.checkpoints.rend();
 
                                     if (!do_reset) {
+                                        const int64_t t_restore = ggml_time_us();
+
                                         // restore the context checkpoint
                                         it->load_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
                                         it->load_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
                                         // restore the draft's speculative state
                                         common_speculative_set_state(spec.get(), slot.id, it->data_spec);
+
+                                        if (phase_timing) {
+                                            SLT_INF(slot, "phase restore: %.3f ms (n_tokens = %" PRId64 ", tgt = %.3f MiB, dft = %.3f MiB)\n",
+                                                    (ggml_time_us() - t_restore) / 1000.0, it->n_tokens,
+                                                    (float) it->data_tgt.size() / 1024 / 1024, (float) it->data_dft.size() / 1024 / 1024);
+                                        }
 
                                         pos_next = std::min(pos_next, std::max(it->pos_min + 1, it->pos_max));
                                         n_past   = std::min(slot.prompt.tokens.size_up_to_pos(pos_next), (size_t) it->n_tokens);
@@ -3794,13 +3826,17 @@ private:
         // yield to the queue, so we can still handle metrics tasks while decoding
         // note: the sync is done here too, so that the wait is also covered by the yield
         int ret = 0;
+        const int64_t t_decode = ggml_time_us();
         if (!abort_decode) {
             queue_tasks.yield_to_queue([&]() {
                 ret = llama_decode(ctx_tgt, batch_view);
-                if (ret == 0 && has_output) {
+                if (ret == 0 && (has_output || phase_timing)) {
                     llama_synchronize(ctx_tgt);
                 }
             });
+        }
+        if (phase_timing) {
+            SRV_INF("phase decode: %.3f ms (n_tokens = %d, ret = %d)\n", (ggml_time_us() - t_decode) / 1000.0, batch_view.n_tokens, ret);
         }
 
         bool dropped = false;
@@ -3875,9 +3911,16 @@ private:
         //       ref: https://github.com/ggml-org/llama.cpp/pull/22728#issuecomment-4400925384
         if (spec) {
             bool ok = true;
+            const int64_t t_draft = ggml_time_us();
             queue_tasks.yield_to_queue([&]() {
                 ok = common_speculative_process(spec.get(), batch_view);
+                if (phase_timing && ctx_dft) {
+                    llama_synchronize(ctx_dft);
+                }
             });
+            if (phase_timing) {
+                SRV_INF("phase draft-process: %.3f ms (n_tokens = %d)\n", (ggml_time_us() - t_draft) / 1000.0, batch_view.n_tokens);
+            }
 
             if (!ok) {
                 SRV_ERR("%s", "failed to process speculative batch\n");
