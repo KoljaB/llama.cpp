@@ -37,6 +37,9 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
     add((new field_bool("return_progress", params.return_progress))
         ->set_desc("Include prompt processing progress events in stream mode"));
 
+    add((new field_bool("ctx_checkpoints", params.ctx_checkpoints))
+        ->set_desc("Create context checkpoints for this request (default true). Set false for a short throwaway request whose state is never resumed: no checkpoint saves, the prompt tail is processed in one batch"));
+
     add((new field_num("sse_ping_interval", params.sse_ping_interval))
         ->set_hard_limits(-1, INT32_MAX)
         ->set_desc("Interval in seconds between SSE comment pings emitted while the stream stays silent, -1 disables pings"));

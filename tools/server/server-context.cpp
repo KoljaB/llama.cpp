@@ -3547,6 +3547,10 @@ private:
                     // make checkpoints only for completion tasks
                     do_checkpoint = do_checkpoint && slot.task->type == SERVER_TASK_TYPE_COMPLETION;
 
+                    // per-request opt-out (Miep listening-cue probes): no checkpoint saves and no batch
+                    // breaks at user-message starts or n-4, so a short throwaway tail is one decode batch
+                    do_checkpoint = do_checkpoint && slot.task->params.ctx_checkpoints;
+
                     // make a checkpoint of the parts of the memory that cannot be rolled back.
                     // checkpoints are created only if:
                     // - the model does not support partial sequence removal
